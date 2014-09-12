@@ -1,0 +1,383 @@
+#lang racket
+(require "aa-redex-core.rkt")
+(require "aa-redex-type.rkt")
+(require "aa-redex-util.rkt")
+
+(require redex/reduction-semantics)
+
+(define-metafunction aa-machine
+  lookup-ρ : ρ x -> v
+  [(lookup-ρ ε x) ,(error "not found in environment:" `x)]
+  [(lookup-ρ (x v ρ) x) v]
+  [(lookup-ρ (x_not-it v ρ) x) (lookup-ρ ρ x)])
+
+(define-metafunction aa-machine
+  extend-ρ : ρ ((x v) ...) -> ρ
+  [(extend-ρ ρ ()) ρ]
+  [(extend-ρ ρ ((x_car v_car) (x_cdr v_cdr) ...))
+   (x_car v_car (extend-ρ ρ ((x_cdr v_cdr) ...)))])
+
+
+
+(define-metafunction aa-machine
+  free-atoms-in-ρ : Γ ρ -> (a ...)
+  [(free-atoms-in-ρ Γ ε) ()]
+  [(free-atoms-in-ρ Γ (x v ρ))
+   ,(append `(free-atoms (lookup Γ x) v)
+            `(free-atoms-in-ρ Γ ρ))])
+
+(define (naive-replace tree old new)
+  (match tree
+         [`(,node ...)
+          (map (λ (n) (naive-replace n old new)) node)]
+         [leaf (if (eq? old leaf)
+                   new
+                   leaf)]))
+
+(module+
+ test
+
+ (test-equal (naive-replace '(a (b (a a) (b b b b) a)) 'a 'x)
+             '(x (b (x x) (b b b b) x))))
+
+;; Returns a value α-equivalent (at type τ) to v, but fresh for ρ
+;; and sufficiently disjoint
+(define-metafunction aa-machine
+  freshen : v τ ρ -> v
+  ;; I'm not sure if it's possible to turn off `caching-enabled?` for
+  ;; one metafunction, so I'm taking an extra (ignored) argument ρ. If called
+  ;; twice with the same ρ, it'll generate the same name, but fortunately,
+  ;; we only need to be fresh relative to the ρ, so it'll still be okay.
+  [(freshen (prod v_kid ...) (Prod ((τ_kid β_kid) ...) β_ex) ρ)
+   ,(let ((all_subs `(subs_kid ...)))
+      `(prod
+        (apply-subs-b
+         subs_kid
+         (apply-subs-r (〚〛-subs β_kid ,all_subs) v_kid τ_kid)
+         τ_kid) ...))
+   (where (subs_kid ...)
+          ,(map (λ (τ v i)
+                  (if (not `(β-∈ ,i β_ex))
+                      (map (λ (at) `(,(cadr at) ,(gensym))) `(free-binders ,τ ,v))
+                      `()))
+                `(τ_kid ...)
+                `(v_kid ...)
+                (idxes `(τ_kid ...))))])
+
+(module+
+ test
+
+ (define (check-freshness v τ)
+   (define freshened `(freshen ,v ,τ ε))
+   
+   ;; this counts on `free-atoms` producing output in order deterministic
+   ;; in the structure of the free atoms
+   (test-equal `(free-atoms ,τ ,v)
+               `(free-atoms ,τ ,freshened))
+
+   (test-equal `(disjoint (exposable-atoms ,τ ,v)
+                          (exposable-atoms ,τ ,freshened))
+               #t))
+
+ (check-freshness `(prod (atom a1) (atom a1))
+                  `(Prod ((RefAtom 1) (Atom ∅)) ∅))
+
+ (check-freshness `(prod (atom a1) (atom a1) (atom a1) (atom a1))
+                  `(Prod ((RefAtom 1) (Atom ∅) (RefAtom 3) (Atom ∅)) ∅))
+
+ (check-freshness `(prod (atom a1) (atom a1))
+                  `(Prod ((RefAtom 1) (Atom ∅)) 1))
+
+
+ (define paaaa `(freshen (prod (atom a1) (atom a1) (atom a1) (atom a1))
+                         (Prod ((RefAtom 1) (Atom ∅) (RefAtom 3) (Atom ∅)) ∅)
+                         ε))
+ 
+ ;; The two `a1`s shouldn't have anything to do with each other
+ (test-equal `(disjoint ,(second paaaa) ,(fourth paaaa))
+             #t)
+
+ ;; The export should prevent `a1` from being renamed at all.
+ (test-equal `(freshen (prod (atom a1) (atom a1))
+                       (Prod ((RefAtom 1) (Atom ∅)) 1)
+                       ε)
+             `(prod (atom a1) (atom a1)))
+
+ (define lam `(freshen (prod (atom a1) (atom a1))
+                       (Prod ((RefAtom 1) (Atom ∅)) 1)
+                       ε))
+
+ (test-equal (second (second lam)) (second (third lam)))
+
+ )
+
+
+(define-judgment-form aa-machine
+  #:contract (Γ . ⊢exe . e ρ result)
+  #:mode     (I . ⊢exe . I I O)
+
+  [(where a (fresh-for ρ))
+   ((extend Γ ((x Atom))) . ⊢exe . e (extend-ρ ρ ((x a))) result)
+   ((extend Γ ((x Atom))) . ⊢ty . e τ)
+   (side-condition (or- (equal?- result FAULT)
+                        (disjoint a (free-atoms τ result))))
+   ------------------------------------------------------------- ;; E-Fresh-Ok
+   (Γ . ⊢exe . (efresh x e) ρ result)]
+
+  [(where a (fresh-for ρ))
+   ((extend Γ ((x Atom))) . ⊢exe . e (extend-ρ ρ ((x a))) v)
+   ((extend Γ ((x Atom))) . ⊢ty . e τ)
+   (side-condition (not-disjoint a (free-atoms τ v)))
+   --------------------------------------------------------- ;; E-Fresh-Escape
+   (Γ . ⊢exe . (efresh x e) ρ FAULT)]
+
+  [(Γ . ⊢ty . x τ_obj)
+   (where (prod v_child ...) (freshen (lookup-ρ ρ x) τ_obj ρ))
+   ;; `freshen` is how we generate an α-equivalent value that is
+   ;; sufficiently disjoint
+   (where (Prod ((τ_child β) ...) β_⇑) τ_obj)
+   ((extend Γ ((x_child τ_child) ...)) . ⊢ty . e τ_res)
+   ((extend Γ ((x_child τ_child) ...)) . ⊢exe .
+    e (extend-ρ ρ ((x_child v_child) ...)) result)
+   (side-condition (or- (equal?- result FAULT)
+                       (disjoint (exposable-atoms τ_obj (prod v_child ...))
+                                 (free-atoms τ_res result))))
+   ---------------------------------------------------- ;; E-Open-Ok
+   (Γ . ⊢exe . (eopen x (x_child ...) e) ρ result)]
+
+  [(Γ . ⊢ty . x τ_obj)
+   (where (prod v_child ...) (freshen (lookup-ρ ρ x) τ_obj ρ))
+   (where (Prod ((τ_child β) ...) β_⇑) τ_obj)
+   ((extend Γ ((x_child τ_child) ...)) . ⊢ty . e τ_res)
+   ((extend Γ ((x_child τ_child) ...)) . ⊢exe .
+    e (extend-ρ ρ ((x_child v_child) ...)) result)
+   (side-condition (not-disjoint (exposable-atoms τ_obj (prod v_child ...))
+                                 (free-atoms τ_res result)))
+   ---------------------------------------------------- ;; E-Open-Escape
+   (Γ . ⊢exe . (eopen x (x_child ...) e) ρ FAULT)]
+
+  [(where ((fD_before ... ;; retrieve definition of `f`
+           (define-fn f ((x_formal τ_arg) ...) C_pre τ_ret e_body C_post)
+           fD_after ...))
+          (,@(list (fn-defs)))) ;; sneak the fDs from a parameter
+   (where (v_actual ...) ((lookup-ρ ρ x_actual) ...))
+   ((extend ε ((x_formal τ_arg) ...)) . ⊢exe . e_body
+    (extend-ρ ε ((x_formal v_actual) ...)) result)
+   ----------------------------------------------------------------- ;; E-Call
+   (Γ . ⊢exe . (ecall f x_actual ...) ρ result)]
+
+  ;; TODO handle e_val getting stuck (can we do it without another rule?)
+  [(Γ . ⊢exe . e_val ρ v_val)
+   (Γ . ⊢ty . e_val τ_val)
+   ((extend Γ ((x τ_val))) . ⊢exe . e_body (extend-ρ ρ ((x v_val))) result)
+   ------------------------------------------------------------------ ;; E-Let
+   (Γ . ⊢exe . (elet x C e_val e_body) ρ result)]
+
+  [(Γ . ⊢exe . e_val ρ FAULT)
+   -------------------------------------------- ;; E-Let-Fail
+   (Γ . ⊢exe . (elet x C e_val e_body) ρ FAULT)]
+
+  [(where (inj0 v) (lookup-ρ ρ x))
+   (where (+ τ_left τ_right) (lookup Γ x))
+   ((extend Γ ((x_left τ_left))) . ⊢exe . e_left
+    (extend-ρ ρ ((x_left v))) result)
+   ---------------------------------------------------- ;; E-Case-Left
+   (Γ . ⊢exe . (ecase x x_left e_left x_right e_right) ρ result)]
+
+  [(where (inj1 v) (lookup-ρ ρ x))
+   (where (+ τ_left τ_right) (lookup Γ x))
+   ((extend Γ ((x_right τ_right))) . ⊢exe . e_right
+    (extend-ρ ρ ((x_right v))) result)
+   ---------------------------------------------------- ;; E-Case-Right
+   (Γ . ⊢exe . (ecase x x_left e_left x_right e_right) ρ result)]
+
+  [(where a (lookup-ρ ρ x_0))
+   (where b (lookup-ρ ρ x_1))
+   (where a b)
+   (Γ . ⊢exe . e_0 ρ result)
+   ---------------------------------------- ;; E-If-Yes
+   (Γ . ⊢exe . (eifeq x_0 x_1 e_0 e_1) ρ result)]
+
+
+  [(where a (lookup-ρ ρ x_0))
+   (where b (lookup-ρ ρ x_1))
+   (side-condition (not (equal? a b)))
+   (Γ . ⊢exe . e_1 ρ result)
+   ---------------------------------------- ;; E-If-No
+   (Γ . ⊢exe . (eifeq x_0 x_1 e_0 e_1) ρ result)]
+
+  ;; qlits cannot FAULT so, these don't wrongly get stuck
+  [(Γ . ⊢exe . qlit ρ v) ...
+   -------------------------------------------------- ;; E-Prod
+   (Γ . ⊢exe . (eprod ((qlit β_i) ...) β_e) ρ (prod v ...))]
+
+  [(Γ . ⊢exe . qlit ρ v)
+   -------------------------------------- ;; E-Inj0
+   (Γ . ⊢exe . (einj0 qlit τ) ρ (inj0 v))]
+
+  [(Γ . ⊢exe . qlit ρ v)
+   -------------------------------------- ;; E-Inj1
+   (Γ . ⊢exe . (einj1 τ qlit) ρ (inj1 v))]
+
+  [(where v (lookup-ρ ρ x))
+   ------------------------ ;; E-Ref
+   (Γ . ⊢exe . (ref x) ρ v) ;; there's no runtime distintion between BAtom and RAtom
+   ]
+
+  [(where v (lookup-ρ ρ x))
+   ------------------------ ;; E-Var
+   (Γ . ⊢exe . x ρ v)]
+
+  )
+
+(define (run-program prog)
+  (match prog
+         [`((,fD ...) ,e)
+          (if (typecheck-program prog)
+              (parameterize
+               ((fn-defs fD))
+               (only (judgment-holds (ε . ⊢exe . ,e ε result) result)))
+              (error "program doesn't typecheck!"))]))
+
+(module+
+ test
+ (test-equal
+  (judgment-holds (ε . ⊢exe . (efresh x_a
+                                      (efresh x_b
+                                              (einj0
+                                               (eprod (((ref x_a) ∅) ((ref x_b) 0)) ∅)
+                                               Atom)))
+                     ε
+                     FAULT))
+  #t)
+
+
+ ;;this does much the same as comb->both
+ (define (test-atom-set e xs fn expected)
+   (redex-let* aa-machine
+    ([(x ...) xs]
+     [(x_exp ...) expected]
+     [(a ...) (map (λ (x) `(atom ,(gensym))) xs)]
+     [e e]
+     [Γ `(extend ε ((x Atom) ...))]
+     [ρ `(extend-ρ ε ((x a) ...))]
+     [τ (only (judgment-holds (Γ . ⊢ty . e τ) τ))]
+     [v (only (judgment-holds (Γ . ⊢exe . e ρ v) v))])
+
+    (test-equal
+     (nmlz (match fn
+                  ['free-atoms `(free-atoms τ v)]
+                  ))
+     (nmlz `((lookup-ρ ρ x_exp) ...)))))
+
+ (test-atom-set `(eprod (((ref x_1) ∅) ((ref x_2) ∅) ((ref x_1) ∅)) ∅)
+                `(x_1 x_2) 'free-atoms `(x_1 x_2))
+
+
+ (test-atom-set `(eprod ((x_1 ∅) ((ref x_2) ∅) ((ref x_1) 0)) ∅)
+                `(x_1 x_2) 'free-atoms `(x_2))
+
+ (define f1-fD
+   `(define-fn f1 ((x1 Atom) (x2 (+ Atom (Prod ((RefAtom ∅)) ∅)))) true
+      (Prod ((RefAtom 2) (RefAtom 2) (Atom ∅)) ∅)
+      (efresh x3
+              (ecase x2
+                     x2-atom (eprod (((ref x1) 2) ((ref x2-atom) 2) (x2-atom ∅)) ∅)
+                     x2-prod (eopen x2-prod (x2-atom)
+                                    (eprod (((ref x1) 2) ((ref x3) 2) (x3 ∅)) ∅))))
+      true))
+
+ (test-equal
+  (judgment-holds
+   ((x1 Atom (x2 (+ Atom (Prod ((RefAtom ∅)) ∅)) ε)) . ⊢exe .
+    (efresh x3
+            (ecase x2 ;;                 ↓ this is why it faults
+                   x2-atom (eprod (((ref x3) 2) ((ref x2-atom) 2) (x2-atom ∅)) ∅)
+                   x2-prod (eopen x2-prod (x2-atom)
+                                  (eprod (((ref x1) 2) ((ref x3) 2) (x3 ∅)) ∅))))
+    (x1 (atom a_argx1) (x2 (inj0 (atom a_argx2)) ε))
+    any
+    )
+   any)
+  `(FAULT))
+
+ (define f2-fD
+   `(define-fn f2 ((x1 Atom)) true Atom x1 true))
+
+ (test-equal
+  (run-program
+   `((,f2-fD)
+     (efresh x1
+             (ecall f2 x1))))
+  `FAULT) ;; x1 escapes
+
+
+ (test-matches
+  (run-program
+   `((,f2-fD)
+     (efresh x1
+             (elet x2 true
+                   (ecall f2 x1)
+                   (eprod (((ref x2) 1) (x1 ∅)) ∅)))))
+  (prod a_a a_a))
+
+ (test-equal
+  (run-program
+   `((,f1-fD)
+     (efresh x1 (efresh x2
+                        (elet x3 true
+                              (einj0 x1 (Prod ((RefAtom ∅)) ∅))
+                              (ecall f1 x2 x3))))))
+  `FAULT) ;; x2 escapes
+
+ (test-matches
+  (run-program
+   `((,f1-fD)
+     (efresh x1 (efresh x2
+                        (elet x3 true
+                              (einj0 x1 (Prod ((RefAtom ∅)) ∅))
+                              (elet xhasx2free true
+                                    (ecall f1 x2 x3)
+                                    (eprod ((xhasx2free 1) (x2 ∅)) ∅)))))))
+  (prod (prod a_a a_b a_b) a_a))
+
+ ;; Demonstrate destructuring the same value multiple times and getting fresh
+ ;; names each time.
+ (test-matches
+  (run-program
+   `(()
+     (efresh x1
+             (elet lam true (eprod ((x1 ∅) ((ref x1) 0)) ∅)
+                   (eopen lam (bdr1 ref1)
+                          (eopen lam (bdr2 ref2)
+                                 (eprod ((bdr1 ∅) (bdr2 ∅)
+                                         (ref1 (⊎ 0 1)) (ref2 (⊎ 0 1))) ∅)))))))
+  (prod a_a a_b a_a a_b))
+
+
+ ;; I was briefly worried that case needed to be able to FAULT, like fresh and
+ ;; open. This convinced me that it's okay; case isn't introducing new atoms.
+ (test-equal
+  (run-program
+   `(()
+     (elet x_sum true
+           (efresh x_a (einj0 x_a Atom))
+           (ecase x_sum
+                  x_l (eprod (((ref x_l) ∅)) ∅)
+                  x_r (eprod (((ref x_r) ∅)) ∅)))))
+  `FAULT)
+
+ (test-equal
+  (run-program
+   `(()
+     (efresh x_a
+             (elet x_sum true
+                   (einj0 x_a Atom)
+                   (ecase x_sum
+                          x_l (eprod (((ref x_l) ∅)) ∅)
+                          x_r (eprod (((ref x_r) ∅)) ∅))))))
+  `FAULT)
+
+
+ (test-results)
+ )
