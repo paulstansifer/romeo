@@ -1,10 +1,6 @@
-Romeo:
-  You'll need Racket to run this code.
 
-  Romeo is implemented in Redex. The actual execution of Romeo programs is in aa-redex-exec.rkt, where there are also some tests that should make things at least somewhat clear. Languages are defined in aa-redex-core.rkt. All implementation is in files beginning with `aa-redex-`. The paper is contained in `icfp2014/`.
+You'll need Racket to run this code.
 
+Romeo is implemented in Redex (included in Racket). The actual execution of Romeo programs is in aa-redex-exec.rkt, where there are also some tests that should make things at least somewhat clear. Languages are defined in aa-redex-core.rkt, which might be a good place to start (it documents some of the notational differences with the paper). 
 
-Romeo-L:
-  I haven't checked to see if the Romeo-to-Romeo-L link hasn't bitrotted.
-
-  Romeo-L has a hashlang associated with it. To enable hashlangs, use `raco link <name of directory>` and then `#lang <name of directory>'
+To run all the tests, do `raco test aa-redex-*`.
